@@ -875,10 +875,10 @@ if __name__ == "__main__":
                         continue
                     
                     if result['code'] == 0:
-                        print(f"[自动拉黑]用户 {name} (性别: {gender}) 拉黑成功")
+                        print(f"[自动拉黑]用户 {name} 拉黑成功")
                         blacklist_count += 1
                     elif result['code'] == 22120:
-                        print(f"[自动拉黑]用户 {name} (性别: {gender}) 已经被拉黑")
+                        print(f"[自动拉黑]用户 {name} 已经被拉黑")
                         already_blacklisted_count += 1
                     elif result['code'] == -101:
                         print(f"[自动拉黑]账号未登录！请检查cookies")
@@ -922,5 +922,6 @@ if __name__ == "__main__":
         print("\n错误详情:")
         traceback.print_exc()
         exit_with_pause(1)
+
 
 

@@ -871,7 +871,7 @@ if __name__ == "__main__":
 
                         result = blacklist_user(uid, name, cookies)
                     else:
-                        print(f"[自动拉黑]用户 {uid} - {name} 性别为{gender}，跳过拉黑")
+                        print(f"[自动拉黑]跳过所有性别，跳过用户 {uid} - {name}")
                         continue
                     
                     if result['code'] == 0:
@@ -922,4 +922,5 @@ if __name__ == "__main__":
         print("\n错误详情:")
         traceback.print_exc()
         exit_with_pause(1)
+
 

@@ -634,7 +634,7 @@ def get_wbi_keys(cookies):
                 img_key = img_url.split("/")[-1].split(".")[0]
                 sub_key = sub_url.split("/")[-1].split(".")[0]
                 
-                print(f"[自动拉黑]成功获取wbi密钥:")
+                print(f"[自动拉黑]成功获取wbi密钥")
                 return img_key, sub_key
     except Exception as e:
         print(f"[自动拉黑]获取wbi密钥失败: {e}")
@@ -922,6 +922,7 @@ if __name__ == "__main__":
         print("\n错误详情:")
         traceback.print_exc()
         exit_with_pause(1)
+
 
 
 

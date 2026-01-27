@@ -34,6 +34,16 @@ from urllib.parse import urlparse, parse_qs
 import msvcrt
 import traceback
 
+# 添加RSA加密库
+try:
+    from Crypto.Cipher import PKCS1_OAEP
+    from Crypto.PublicKey import RSA
+    from Crypto.Hash import SHA256
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    print("⚠️  Crypto模块未安装，Cookie刷新功能将不可用")
+    print("   请安装: pip install pycryptodome")
+    CRYPTO_AVAILABLE = False
 
 # 配置文件路径
 CONFIG_FILE = "config.json"
@@ -267,11 +277,12 @@ class ConfigManager:
         print(f"跳过的性别: {', '.join(skip_sex)}")
         print("="*50)
 
-# 登录系统类
+# 登录系统类（带Cookie刷新机制）
 class BilibiliQRLogin:
     def __init__(self):
         self.session = requests.Session()
         self.cookies = {}
+        self.refresh_token = None
         
         # 设置基础headers
         self.headers = {
@@ -292,6 +303,237 @@ class BilibiliQRLogin:
         }
         
         self.session.headers.update(self.headers)
+        
+        # RSA公钥，用于Cookie刷新
+        if CRYPTO_AVAILABLE:
+            self.public_key = RSA.import_key('''\
+-----BEGIN PUBLIC KEY-----
+MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDLgd2OAkcGVtoE3ThUREbio0Eg
+Uc/prcajMKXvkCKFCWhJYJcLkcM2DKKcSeFpD/j6Boy538YXnR6VhcuUJOhH2x71
+nzPjfdTcqMz7djHum0qSZA0AyCBDABUqCrfNgCiJ00Ra7GmRj+YCK1NJEuewlb40
+JNrRuoEUXpabUzGB8QIDAQAB
+-----END PUBLIC KEY-----''')
+    
+    def get_correspond_path(self, timestamp):
+        """生成CorrespondPath（RSA加密）"""
+        if not CRYPTO_AVAILABLE:
+            return None
+            
+        try:
+            cipher = PKCS1_OAEP.new(self.public_key, SHA256)
+            message = f'refresh_{timestamp}'.encode('utf-8')
+            encrypted = cipher.encrypt(message)
+            return encrypted.hex()
+        except Exception as e:
+            print(f"生成CorrespondPath失败: {e}")
+            return None
+    
+    def get_refresh_csrf(self, correspond_path):
+        """获取refresh_csrf"""
+        try:
+            url = f'https://www.bilibili.com/correspond/1/{correspond_path}'
+            response = self.session.get(url, timeout=10)
+            
+            if response.status_code != 200:
+                return None
+            
+            # 从HTML中提取refresh_csrf
+            if '<div id="1-name">' in response.text:
+                start = response.text.find('<div id="1-name">') + len('<div id="1-name">')
+                end = response.text.find('</div>', start)
+                refresh_csrf = response.text[start:end].strip()
+                return refresh_csrf
+            else:
+                return None
+                
+        except Exception as e:
+            print(f"获取refresh_csrf出错: {e}")
+            return None
+    
+    def refresh_cookie(self, old_refresh_token, refresh_csrf):
+        """刷新Cookie"""
+        try:
+            # 获取当前Cookie中的bili_jct作为csrf
+            csrf = self.cookies.get('bili_jct')
+            if not csrf:
+                print("未找到bili_jct，无法刷新Cookie")
+                return False
+            
+            url = 'https://passport.bilibili.com/x/passport-login/web/cookie/refresh'
+            data = {
+                'csrf': csrf,
+                'refresh_csrf': refresh_csrf,
+                'source': 'main_web',
+                'refresh_token': old_refresh_token
+            }
+            
+            response = self.session.post(url, data=data, timeout=10)
+            
+            if response.status_code != 200:
+                return False
+            
+            result = response.json()
+            if result['code'] != 0:
+                print(f"刷新Cookie失败: {result['message']}")
+                return False
+            
+            # 更新refresh_token
+            self.refresh_token = result['data']['refresh_token']
+            
+            # 更新本地cookies字典
+            self.cookies = requests.utils.dict_from_cookiejar(self.session.cookies)
+            
+            print("✅ Cookie刷新成功")
+            return True
+            
+        except Exception as e:
+            print(f"刷新Cookie出错: {e}")
+            return False
+    
+    def confirm_refresh(self, old_refresh_token):
+        """确认更新（使旧refresh_token失效）"""
+        try:
+            # 使用新Cookie中的bili_jct作为csrf
+            csrf = self.cookies.get('bili_jct')
+            if not csrf:
+                return False
+            
+            url = 'https://passport.bilibili.com/x/passport-login/web/confirm/refresh'
+            data = {
+                'csrf': csrf,
+                'refresh_token': old_refresh_token
+            }
+            
+            response = self.session.post(url, data=data, timeout=10)
+            
+            if response.status_code != 200:
+                return False
+            
+            result = response.json()
+            if result['code'] != 0:
+                return False
+            
+            return True
+            
+        except Exception as e:
+            print(f"确认更新出错: {e}")
+            return False
+    
+    def check_and_refresh_cookie(self):
+        """检查并刷新Cookie（完整的刷新流程）"""
+        if not CRYPTO_AVAILABLE or not self.refresh_token:
+            return True
+            
+        try:
+            # 1. 检查是否需要刷新
+            csrf = self.cookies.get('bili_jct')
+            url = 'https://passport.bilibili.com/x/passport-login/web/cookie/info'
+            params = {'csrf': csrf} if csrf else {}
+            
+            response = self.session.get(url, params=params, timeout=10)
+            
+            if response.status_code != 200:
+                return True  # 如果检查失败，继续使用现有Cookie
+            
+            result = response.json()
+            if result['code'] != 0:
+                return True
+            
+            if not result['data']['refresh']:
+                # 不需要刷新
+                return True
+            
+            print("🔄 检测到Cookie需要刷新，开始刷新流程...")
+            
+            # 2. 获取时间戳并生成CorrespondPath
+            timestamp = result['data']['timestamp']
+            correspond_path = self.get_correspond_path(timestamp)
+            if not correspond_path:
+                return False
+            
+            # 3. 获取refresh_csrf
+            refresh_csrf = self.get_refresh_csrf(correspond_path)
+            if not refresh_csrf:
+                return False
+            
+            # 4. 保存旧的refresh_token
+            old_refresh_token = self.refresh_token
+            
+            # 5. 刷新Cookie
+            if not self.refresh_cookie(old_refresh_token, refresh_csrf):
+                return False
+            
+            # 6. 确认更新
+            if not self.confirm_refresh(old_refresh_token):
+                return False
+            
+            print("✅ Cookie刷新流程完成")
+            return True
+            
+        except Exception as e:
+            print(f"检查并刷新Cookie出错: {e}")
+            return True  # 即使出错也继续使用现有Cookie
+    
+    def verify_cookies_simple(self):
+        """简单验证cookies是否有效（不自动刷新）"""
+        try:
+            response = self.session.get(
+                'https://api.bilibili.com/x/web-interface/nav',
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if data.get('code') == 0:
+                    # Cookie有效
+                    user_info = data.get('data', {})
+                    print(f"✅ Cookie验证成功，用户: {user_info.get('uname', '未知')}")
+                    return True
+                else:
+                    print(f"❌ Cookies无效，错误码: {data.get('code')}")
+                    return False
+            else:
+                print(f"❌ 验证请求失败，状态码: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            print(f"❌ 验证过程中出错: {str(e)}")
+            return False
+    
+    def verify_and_refresh_cookies(self):
+        """验证cookies是否有效，如果无效则尝试刷新"""
+        try:
+            response = self.session.get(
+                'https://api.bilibili.com/x/web-interface/nav',
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if data.get('code') == 0:
+                    # Cookie有效
+                    user_info = data.get('data', {})
+                    print(f"✅ Cookie验证成功，用户: {user_info.get('uname', '未知')}")
+                    return True
+                else:
+                    print(f"❌ Cookies无效，错误码: {data.get('code')}")
+                    
+                    # 尝试刷新Cookie
+                    if self.refresh_token:
+                        print("🔄 尝试刷新Cookie...")
+                        if self.check_and_refresh_cookie():
+                            # 刷新成功后重新验证
+                            return self.verify_and_refresh_cookies()
+                    return False
+            else:
+                print(f"❌ 验证请求失败，状态码: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            print(f"❌ 验证过程中出错: {str(e)}")
+            return False
         
     def get_initial_cookies(self):
         # 访问B站主页获取初始cookies
@@ -409,7 +651,14 @@ class BilibiliQRLogin:
                 if code == 0:
                     # 登录成功
                     login_url = login_data['data']['url']
-                    print("✅ 登录成功！")
+                    refresh_token = login_data['data'].get('refresh_token', '')
+                    
+                    if refresh_token:
+                        self.refresh_token = refresh_token
+                        print("✅ 登录成功！refresh_token已保存")
+                    else:
+                        print("✅ 登录成功！")
+                    
                     return login_url
                 elif code == 86038:
                     # 二维码已失效
@@ -464,30 +713,6 @@ class BilibiliQRLogin:
         # 更新类的cookies字典
         self.cookies.update(new_cookies)
         return self.cookies
-        
-    def verify_cookies(self):
-        try:
-            response = self.session.get(
-                'https://api.bilibili.com/x/web-interface/nav',
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                if data.get('code') == 0:
-                    user_info = data.get('data', {})
-                    return True
-                else:
-                    print(f"❌ Cookies无效，错误码: {data.get('code')}")
-                    return False
-            else:
-                print(f"❌ 验证请求失败，状态码: {response.status_code}")
-                return False
-                
-        except Exception as e:
-            print(f"❌ 验证过程中出错: {str(e)}")
-            return False
             
     def login(self):
         # 1. 获取初始cookies
@@ -519,34 +744,50 @@ class BilibiliQRLogin:
         self.update_session_cookies(new_cookies)
         
         # 7. 验证cookies
-        if self.verify_cookies():
+        if self.verify_and_refresh_cookies():
             print("\n🎉 登录成功！")
             
-            # 保存cookies到文件
-            self.save_cookies()
+            # 保存cookies和refresh_token到文件
+            self.save_login_data()
             return True
         else:
             print("\n❌ 登录失败")
             return False
             
-    def save_cookies(self, filename='bilibili_cookies.json'):
+    def save_login_data(self, filename='bilibili_login_data.json'):
         try:
             # 将RequestsCookieJar转换为字典
             cookies_dict = requests.utils.dict_from_cookiejar(self.session.cookies)
             
+            # 保存完整数据
+            data_to_save = {
+                'cookies': cookies_dict,
+                'refresh_token': self.refresh_token,
+                'save_time': time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+            
             with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(cookies_dict, f, indent=2, ensure_ascii=False)
-            print(f"✅ Cookies已保存到: {filename}")
+                json.dump(data_to_save, f, indent=2, ensure_ascii=False)
+            print(f"✅ Cookies和refresh_token已保存到: {filename}")
             return True
         except Exception as e:
-            print(f"❌ 保存cookies失败: {str(e)}")
+            print(f"❌ 保存登录数据失败: {str(e)}")
             return False
             
-    def load_cookies(self, filename='bilibili_cookies.json'):
+    def load_login_data(self, filename='bilibili_login_data.json'):
         try:
             with open(filename, 'r', encoding='utf-8') as f:
-                cookies_dict = json.load(f)
-                
+                data = json.load(f)
+            
+            # 兼容旧版本（只有cookies的情况）
+            if isinstance(data, dict) and 'cookies' in data:
+                cookies_dict = data['cookies']
+                self.refresh_token = data.get('refresh_token')
+            else:
+                # 旧版本，只有cookies
+                cookies_dict = data
+                self.refresh_token = None
+            
             # 清空当前session的cookies
             self.session.cookies.clear()
             
@@ -555,13 +796,20 @@ class BilibiliQRLogin:
                 self.session.cookies.set(name, value)
                 
             self.cookies = cookies_dict
-            print(f"✅ 已从 {filename} 加载cookies")
+            
+            if self.refresh_token:
+                print(f"✅ 已从 {filename} 加载cookies和refresh_token")
+            else:
+                print(f"✅ 已从 {filename} 加载cookies（未找到refresh_token）")
             return True
         except FileNotFoundError:
             print(f"❌ 文件 {filename} 不存在")
             return False
+        except json.JSONDecodeError:
+            print(f"❌ 文件 {filename} 格式错误")
+            return False
         except Exception as e:
-            print(f"❌ 加载cookies失败: {str(e)}")
+            print(f"❌ 加载登录数据失败: {str(e)}")
             return False
             
     def get_user_info(self):
@@ -578,20 +826,20 @@ class BilibiliQRLogin:
         except Exception as e:
             print(f"获取用户信息失败: {str(e)}")
         return {}
-        
+    
     def get_cookies_dict(self):
         return requests.utils.dict_from_cookiejar(self.session.cookies)
     
     def run_login_flow(self):
         print("\n" + "="*50)
-        print("B站自动拉黑脚本 - 登录系统")
+        print("B站自动拉黑脚本 - 登录系统（带Cookie自动刷新）")
         print("="*50)
         
-        # 尝试加载已有cookies
-        print("\n尝试加载已有cookies...")
-        if self.load_cookies():
-            if self.verify_cookies():
-                print("✅ 已有cookies有效，无需重新登录")
+        # 尝试加载已有登录数据
+        print("\n尝试加载已有登录数据...")
+        if self.load_login_data():
+            if self.verify_and_refresh_cookies():
+                print("✅ 登录状态有效")
                 
                 # 显示用户信息
                 user_info = self.get_user_info()
@@ -604,9 +852,9 @@ class BilibiliQRLogin:
                     
                 return True
             else:
-                print("❌ 已有cookies无效，需要重新登录")
+                print("❌ 已有登录数据无效，需要重新登录")
         else:
-            print("❌ 未找到cookies文件，需要登录")
+            print("❌ 未找到登录数据文件，需要登录")
             
         # 开始登录流程
         print("\n开始新的登录流程...")
@@ -765,7 +1013,7 @@ if __name__ == "__main__":
         # 显示配置摘要
         config_manager.show_config_summary()
         
-        # 3. 初始化登录系统
+        # 3. 初始化登录系统（带Cookie刷新）
         login_system = BilibiliQRLogin()
         
         # 4. 运行登录流程
@@ -802,6 +1050,13 @@ if __name__ == "__main__":
             print("="*50)
             wts = round(time.time())
             print(f'[自动拉黑]正在抓取第 {n} 页，当前时间 {wts}')
+            
+            # 每页开始时检查并刷新Cookie
+            print("[自动拉黑]检查Cookie状态...")
+            login_system.check_and_refresh_cookie()
+            
+            # 获取更新后的cookies
+            cookies = login_system.get_cookies_dict()
             
             # 构建参数
             params = {
@@ -881,9 +1136,23 @@ if __name__ == "__main__":
                         print(f"[自动拉黑]用户 {name} 已经被拉黑")
                         already_blacklisted_count += 1
                     elif result['code'] == -101:
-                        print(f"[自动拉黑]账号未登录！请检查cookies")
-                        login_error = True
-                        break
+                        print(f"[自动拉黑]账号未登录！尝试刷新Cookie...")
+                        # 尝试刷新Cookie
+                        if login_system.check_and_refresh_cookie():
+                            # 刷新后重试
+                            cookies = login_system.get_cookies_dict()
+                            result = blacklist_user(uid, name, cookies)
+                            if result['code'] == 0:
+                                print(f"[自动拉黑]用户 {name} 拉黑成功")
+                                blacklist_count += 1
+                            else:
+                                print(f"[自动拉黑]拉黑失败: {result}")
+                                login_error = True
+                                break
+                        else:
+                            print(f"[自动拉黑]Cookie刷新失败，请重新登录")
+                            login_error = True
+                            break
                     else:
                         print(f"[自动拉黑]拉黑失败: {result}")
                     
@@ -909,11 +1178,19 @@ if __name__ == "__main__":
         print(f"已拉黑用户: {already_blacklisted_count} 个用户")
         print("="*50)
         
+        # 保存最新的登录数据
+        login_system.save_login_data()
+        
         # 正常退出
         print_success_and_exit("程序执行完成", 0)
         
     except KeyboardInterrupt:
         print("\n\n⚠️ 用户中断程序执行")
+        # 保存当前的登录数据
+        try:
+            login_system.save_login_data()
+        except:
+            pass
         exit_with_pause(0)
     except Exception as e:
         print("\n❌ 程序发生未预期的错误:")
@@ -921,8 +1198,9 @@ if __name__ == "__main__":
         print(f"错误信息: {str(e)}")
         print("\n错误详情:")
         traceback.print_exc()
+        # 尝试保存当前的登录数据
+        try:
+            login_system.save_login_data()
+        except:
+            pass
         exit_with_pause(1)
-
-
-
-
